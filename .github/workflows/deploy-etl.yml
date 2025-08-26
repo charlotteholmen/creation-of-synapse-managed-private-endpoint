@@ -1,0 +1,198 @@
+name: Promote Workspace
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment-message:
+        description: "Deployment Description"
+        required: true
+      environment-target:
+        type: choice
+        description: "Target environment"
+        required: true
+        options:
+          - Test
+          - Test_USSC
+          - Stage
+          - Prod
+      SRF-number:
+        description: 'SRF # (Required for "Prod")'
+        required: false
+      artifact-name:
+        description: 'Specify artifact "Prod" or "Stage" only (from previous "Test" only deployment)'
+        required: false
+      pending-PR:
+        description: "Enter link to outstanding Pull Requests to be reviewed:"
+        required: false
+
+# Prevent concurrent runs per environment
+concurrency:
+  group: promote-${{ github.event.inputs.environment-target }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # When deploying to Prod/Stage, use the provided artifact-name (if any).
+  # Otherwise, compute the artifact name from the ref/run info.
+  ARTIFACT_NAME: ${{ ( (github.event.inputs.environment-target == 'Prod' || github.event.inputs.environment-target == 'Stage') && github.event.inputs['artifact-name'] != '' ) && github.event.inputs['artifact-name'] || format('{0}-{1}.{2}', github.ref_name, github.run_id, github.run_number) }}
+
+  PENDING_PR_URL: ${{ github.event.inputs['pending-PR'] }}
+
+# Include SRF number in the run name for Prod
+run-name: ${{ contains(github.event.inputs['environment-target'], 'Prod') && format('{0}- {1}-{2}({3})-{4}', 'Synapse Wksp ', github.event.inputs['environment-target'], 'SRF', github.event.inputs['SRF-number'], github.event.inputs['deployment-message']) || format('{0}- {1}-{2}', 'Synapse Wksp ', github.event.inputs['environment-target'], github.event.inputs['deployment-message']) }}
+
+jobs:
+  # Guard: allow manual runs only from the two intended branches
+  prerequisite:
+    if: ${{ github.ref_name == 'workspace_publish_dev' || github.ref_name == 'workspace_publish_prod_source' }}
+    runs-on: ubuntu-latest
+    outputs:
+      artifactName: ${{ env.ARTIFACT_NAME }} # pass computed artifact forward
+    steps:
+      - name: PR NEEDS REVIEW (if applicable)
+        if: ${{ github.event.inputs['pending-PR'] != '' }}
+        run: echo "PR to review = $PENDING_PR_URL"
+
+  store-artifact:
+    # Only prepare & upload artifacts for Test targets
+    if: ${{ needs.prerequisite.result == 'success' && contains(github.event.inputs['environment-target'], 'Test') }}
+    needs: prerequisite
+    runs-on: ubuntu-latest
+    outputs:
+      collabSHA: ${{ env.COLLAB_SHA }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: templates
+
+      - name: Copy template files to publish directory
+        run: |
+          mkdir -p ./publish
+          cp -r ./templates/da-dev-usnc-synw-001/ ./publish
+
+      # (Optional) context dumps for debugging
+      - name: Dump GH context
+        env:
+          GITHUB_CONTEXT: ${{ toJson(github) }}
+        run: echo "$GITHUB_CONTEXT"
+
+      - name: Dump job context
+        env:
+          JOB_CONTEXT: ${{ toJson(job) }}
+        run: echo "$JOB_CONTEXT"
+
+      - name: Dump steps context
+        env:
+          STEPS_CONTEXT: ${{ toJson(steps) }}
+        run: echo "$STEPS_CONTEXT"
+
+      - name: Dump runner context
+        env:
+          RUNNER_CONTEXT: ${{ toJson(runner) }}
+        run: echo "$RUNNER_CONTEXT"
+
+      - name: Dump matrix context
+        env:
+          MATRIX_CONTEXT: ${{ toJson(matrix) }}
+        run: echo "$MATRIX_CONTEXT"
+
+      - name: Extract SHA from commit message (fallback to branch)
+        working-directory: ./templates
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          echo "Commit SHA: $WORKFLOW_SHA"
+          git log --format=%B -n 1 "$WORKFLOW_SHA"
+          GIT_LOG_MSG=$(git log --format=%B -n 1 "$WORKFLOW_SHA" | grep -oE '[0-9a-f]{40}' | head -n 1 || true)
+          if [[ -n "$GIT_LOG_MSG" ]]; then
+            echo "SHA found in commit message"
+            SHA="$GIT_LOG_MSG"
+          else
+            echo "SHA not found in commit message"
+            SHA="refs/heads/develop_current"
+          fi
+          echo "Selected SHA: $SHA"
+          echo "COLLAB_SHA=$SHA" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COLLAB_SHA }}
+          path: collab_artifacts
+
+      - name: Sync collab artifacts into publish directory
+        run: |
+          rsync -a --exclude='*.git' --exclude='.github' --exclude='da-dev-usnc-synw-001' ./collab_artifacts/ ./publish/
+          ls -la ./publish
+
+      - name: Upload publish artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ./publish
+
+  synapse-test:
+    if: ${{ needs.prerequisite.result == 'success' && github.event.inputs['environment-target'] == 'Test' }}
+    needs:
+      - prerequisite
+      - store-artifact
+    uses: ./.github/workflows/deploysynapse.yaml
+    secrets:
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    with:
+      ENVIRONMENT: Test
+      ARTIFACT_NAME: ${{ needs.prerequisite.outputs.artifactName }}
+
+  synapse-test_ussc:
+    if: ${{ needs.prerequisite.result == 'success' && github.event.inputs['environment-target'] == 'Test_USSC' }}
+    needs:
+      - prerequisite
+      - store-artifact
+    uses: ./.github/workflows/deploysynapse.yaml
+    secrets:
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    with:
+      ENVIRONMENT: Test_USSC
+      ARTIFACT_NAME: ${{ needs.prerequisite.outputs.artifactName }}
+
+  synapse-stage:
+    if: ${{ needs.prerequisite.result == 'success' && github.event.inputs['environment-target'] == 'Stage' }}
+    needs:
+      - prerequisite
+      - store-artifact
+    uses: ./.github/workflows/deploysynapse.yaml
+    secrets:
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    with:
+      ENVIRONMENT: Stage
+      ARTIFACT_NAME: ${{ needs.prerequisite.outputs.artifactName }}
+
+  synapse-prod:
+    if: ${{ needs.prerequisite.result == 'success' && github.event.inputs['environment-target'] == 'Prod' }}
+    needs:
+      - prerequisite
+      - store-artifact
+    uses: ./.github/workflows/deploysynapse.yaml
+    secrets:
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    with:
+      ENVIRONMENT: Prod
+      ARTIFACT_NAME: ${{ needs.prerequisite.outputs.artifactName }}
